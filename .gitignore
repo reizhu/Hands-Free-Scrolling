@@ -1,0 +1,18 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# Collected training data (keep folder structure, ignore media)
+data/images/
+data/landmarks/
+data/videos/
+*.mp4
+*.avi
+*.mov
+
+# Keep the MediaPipe .task model in git if you want teammates offline-ready;
+# uncomment the next line to ignore it instead:
+# models/*.task
