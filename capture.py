@@ -2,26 +2,27 @@
 Webcam capture + MediaPipe hand landmarks + labeled saves.
 
 Keys:
-  1  set label scroll_up   (still)
-  2  set label scroll_down (still)
-  3  set label switch      (manual video record)
-  0  set label idle        (still)
-  s  save still (pose / idle labels only)
-  r  start/stop switch recording (only when label is switch)
+  1  set label scroll_up   (still only)
+  2  set label scroll_down (still only)
+  3  set label switch      (video only)
+  0  set label idle        (still + video)
+  s  save still (scroll_up / scroll_down / idle)
+  r  start/stop video recording (switch / idle)
   q  quit
 
-Pose labels save:
-  data/images/<label>/<timestamp>.jpg
-  data/landmarks/<label>/<timestamp>.json
+Stills:
+  data/images/<label>/<label>_<n>.jpg
+  data/landmarks/<label>/<label>_<n>.json
 
-switch (press r to start, r again to stop):
-  data/videos/switch/<timestamp>.mp4
-  data/landmarks/switch/<timestamp>.json   (per-frame landmark sequence)
+Videos (r start, r stop):
+  data/videos/<label>/<label>_<n>.mp4
+  data/landmarks/<label>/<label>_<n>.json   (per-frame landmark sequence)
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -44,7 +45,11 @@ LABELS = {
     ord("0"): "idle",
 }
 
-VIDEO_LABELS = {"switch"}
+# switch: video only. idle: still + video. scroll_*: still only.
+VIDEO_ONLY_LABELS = {"switch"}
+RECORDABLE_LABELS = {"switch", "idle"}
+STILL_LABELS = {"scroll_up", "scroll_down", "idle"}
+
 TARGET_FPS = 30
 MAX_RECORD_SECONDS = 5.0
 MIN_HAND_FRAMES = 5
@@ -80,14 +85,30 @@ HAND_CONNECTIONS = [
 
 def ensure_dirs() -> None:
     for label in LABELS.values():
-        (IMAGE_DIR / label).mkdir(parents=True, exist_ok=True)
         (LANDMARK_DIR / label).mkdir(parents=True, exist_ok=True)
-        if label in VIDEO_LABELS:
+        if label in STILL_LABELS:
+            (IMAGE_DIR / label).mkdir(parents=True, exist_ok=True)
+        if label in RECORDABLE_LABELS:
             (VIDEO_DIR / label).mkdir(parents=True, exist_ok=True)
 
 
-def make_stamp() -> str:
-    return time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time() % 1) * 1000):03d}"
+def next_sample_name(label: str) -> str:
+    """Return next unused name: <label>_0, <label>_1, ... across images/videos/landmarks."""
+    pattern = re.compile(rf"^{re.escape(label)}_(\d+)$")
+    used: set[int] = set()
+    for folder in (IMAGE_DIR / label, VIDEO_DIR / label, LANDMARK_DIR / label):
+        if not folder.exists():
+            continue
+        for path in folder.iterdir():
+            if not path.is_file():
+                continue
+            match = pattern.match(path.stem)
+            if match:
+                used.add(int(match.group(1)))
+    n = 0
+    while n in used:
+        n += 1
+    return f"{label}_{n}"
 
 
 def landmarks_to_list(hand_landmarks) -> list[dict]:
@@ -116,22 +137,82 @@ def draw_hand(frame: np.ndarray, hand_landmarks) -> None:
         cv2.line(frame, points[start], points[end], (0, 200, 255), 2, lineType=cv2.LINE_AA)
 
 
+def wrap_text(text: str, max_width_px: int, font_scale: float, thickness: int) -> list[str]:
+    """Split text into lines that fit within max_width_px (OpenCV putText)."""
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    words = text.split(" ")
+    if not words:
+        return []
+
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        (w, _), _ = cv2.getTextSize(candidate, font, font_scale, thickness)
+        if w <= max_width_px:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+            (w, _), _ = cv2.getTextSize(current, font, font_scale, thickness)
+            # Hard-split an oversized token so it can't blow past the edge.
+            while w > max_width_px and len(current) > 1:
+                cut = max(1, len(current) // 2)
+                # Shrink until the left piece fits.
+                while cut > 1:
+                    (lw, _), _ = cv2.getTextSize(current[:cut], font, font_scale, thickness)
+                    if lw <= max_width_px:
+                        break
+                    cut -= 1
+                lines.append(current[:cut])
+                current = current[cut:]
+                (w, _), _ = cv2.getTextSize(current, font, font_scale, thickness)
+    lines.append(current)
+    return lines
+
+
+def draw_wrapped_text(
+    frame: np.ndarray,
+    text: str,
+    x: int,
+    y: int,
+    font_scale: float = 0.5,
+    color: tuple[int, int, int] = (0, 200, 255),
+    thickness: int = 1,
+    line_height: int = 22,
+    margin_right: int = 12,
+) -> None:
+    max_width = max(40, frame.shape[1] - x - margin_right)
+    for i, line in enumerate(wrap_text(text, max_width, font_scale, thickness)):
+        cv2.putText(
+            frame,
+            line,
+            (x, y + i * line_height),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 def save_still(
     frame: np.ndarray,
     hand_landmarks,
     label: str,
     handedness: str | None,
 ) -> Path:
-    stamp = make_stamp()
-    img_path = IMAGE_DIR / label / f"{stamp}.jpg"
-    json_path = LANDMARK_DIR / label / f"{stamp}.json"
+    name = next_sample_name(label)
+    img_path = IMAGE_DIR / label / f"{name}.jpg"
+    json_path = LANDMARK_DIR / label / f"{name}.json"
 
     cv2.imwrite(str(img_path), frame)
 
     payload = {
         "label": label,
         "type": "still",
-        "timestamp": stamp,
+        "sample": name,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "handedness": handedness,
         "image": str(img_path.relative_to(ROOT)).replace("\\", "/"),
         "landmarks": landmarks_to_list(hand_landmarks),
@@ -140,18 +221,33 @@ def save_still(
     return json_path
 
 
-def save_switch_clip(buffer: list[dict]) -> tuple[Path | None, str]:
-    """Write recorded frames as mp4 + per-frame landmark JSON."""
+def count_video_frames(video_path: Path) -> int:
+    cap = cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        return -1
+    n = 0
+    while True:
+        ok, _ = cap.read()
+        if not ok:
+            break
+        n += 1
+    cap.release()
+    return n
+
+
+def save_video_clip(buffer: list[dict], label: str) -> tuple[Path | None, str]:
+    """Write recorded frames as mp4 + matching per-frame landmark JSON (same name)."""
     if not buffer:
-        return None, "switch: empty recording"
+        return None, f"{label}: empty recording"
 
     frames_with_hand = sum(1 for item in buffer if item["landmarks"] is not None)
     if frames_with_hand < MIN_HAND_FRAMES:
-        return None, f"switch: need ≥{MIN_HAND_FRAMES} hand frames (got {frames_with_hand})"
+        return None, f"{label}: need ≥{MIN_HAND_FRAMES} hand frames (got {frames_with_hand})"
 
-    stamp = make_stamp()
-    video_path = VIDEO_DIR / "switch" / f"{stamp}.mp4"
-    json_path = LANDMARK_DIR / "switch" / f"{stamp}.json"
+    # Same name → same clip: idle_0.mp4 <-> idle_0.json
+    name = next_sample_name(label)
+    video_path = VIDEO_DIR / label / f"{name}.mp4"
+    json_path = LANDMARK_DIR / label / f"{name}.json"
 
     h, w = buffer[0]["frame"].shape[:2]
     writer = cv2.VideoWriter(
@@ -175,20 +271,35 @@ def save_switch_clip(buffer: list[dict]) -> tuple[Path | None, str]:
         )
     writer.release()
 
+    written_frames = len(sequence)
+    verified_frames = count_video_frames(video_path)
     duration_s = (buffer[-1]["t_ms"] - t0) / 1000.0
+    video_rel = str(video_path.relative_to(ROOT)).replace("\\", "/")
+    json_rel = str(json_path.relative_to(ROOT)).replace("\\", "/")
+
     payload = {
-        "label": "switch",
+        "label": label,
         "type": "video",
-        "timestamp": stamp,
+        "sample": name,
+        "pair_id": name,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "fps": TARGET_FPS,
         "duration_seconds": round(duration_s, 3),
-        "num_frames": len(sequence),
+        "num_frames": written_frames,
+        "video_frame_count": verified_frames,
+        "frames_match_video": verified_frames == written_frames,
         "frames_with_hand": frames_with_hand,
-        "video": str(video_path.relative_to(ROOT)).replace("\\", "/"),
+        "video": video_rel,
         "frames": sequence,
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return json_path, f"saved clip {json_path.name} ({len(sequence)} frames, {duration_s:.2f}s)"
+
+    match = "OK" if verified_frames == written_frames else "MISMATCH"
+    msg = (
+        f"saved pair {name} | {video_rel} + {json_rel} | "
+        f"{written_frames} frames, video has {verified_frames} [{match}]"
+    )
+    return json_path, msg
 
 
 def make_landmarker() -> vision.HandLandmarker:
@@ -209,6 +320,26 @@ def make_landmarker() -> vision.HandLandmarker:
     return vision.HandLandmarker.create_from_options(options)
 
 
+def mode_text(label: str, recording: bool) -> str:
+    if recording:
+        return "REC"
+    if label in RECORDABLE_LABELS and label in STILL_LABELS:
+        return "s=still / r=video"
+    if label in RECORDABLE_LABELS:
+        return "ready — press r"
+    return "still"
+
+
+def hint_text(label: str, recording: bool) -> str:
+    if recording:
+        return "r=stop"
+    if label in RECORDABLE_LABELS and label in STILL_LABELS:
+        return "s save still | r start/stop video | q quit"
+    if label in RECORDABLE_LABELS:
+        return "r start/stop video | q quit"
+    return "1/2/3/0 label | s save still | q quit"
+
+
 def main() -> None:
     ensure_dirs()
     landmarker = make_landmarker()
@@ -227,7 +358,7 @@ def main() -> None:
     record_started_ms = 0
 
     print(
-        "Capture running. Keys: 1/2/3/0 label | s=save still | r=start/stop switch | q=quit"
+        "Capture running. Keys: 1/2/3/0 label | s=still | r=video (switch/idle) | q=quit"
     )
 
     try:
@@ -253,7 +384,11 @@ def main() -> None:
                 hand_landmarks = result.hand_landmarks[0]
                 landmark_list = landmarks_to_list(hand_landmarks)
                 if result.handedness:
-                    handedness = result.handedness[0][0].category_name
+                    # Frame is mirrored above for a selfie view, which swaps
+                    # MediaPipe's Left/Right. Flip the label back to the user's
+                    # real hand.
+                    raw = result.handedness[0][0].category_name
+                    handedness = {"Left": "Right", "Right": "Left"}.get(raw, raw)
 
             if recording:
                 record_buffer.append(
@@ -266,7 +401,7 @@ def main() -> None:
                 )
                 elapsed = (frame_ts_ms - record_started_ms) / 1000.0
                 if elapsed >= MAX_RECORD_SECONDS:
-                    path, msg = save_switch_clip(record_buffer)
+                    path, msg = save_video_clip(record_buffer, label)
                     recording = False
                     record_buffer = []
                     if path is not None:
@@ -278,11 +413,7 @@ def main() -> None:
             if hand_landmarks is not None:
                 draw_hand(display, hand_landmarks)
 
-            if label == "switch":
-                mode = "REC" if recording else "ready — press r"
-            else:
-                mode = "still"
-            hud = f"label: {label} ({mode})  saved: {saved_count}"
+            hud = f"label: {label} ({mode_text(label, recording)})  saved: {saved_count}"
             if handedness:
                 hud += f"  hand: {handedness}"
             cv2.putText(
@@ -309,21 +440,10 @@ def main() -> None:
                     2,
                     cv2.LINE_AA,
                 )
-            elif label == "switch":
-                cv2.putText(
-                    display,
-                    "r start/stop switch clip | q quit",
-                    (12, 56),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (220, 220, 220),
-                    1,
-                    cv2.LINE_AA,
-                )
             else:
                 cv2.putText(
                     display,
-                    "1/2/3/0 label | s save still | q quit",
+                    hint_text(label, recording),
                     (12, 56),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55,
@@ -333,16 +453,7 @@ def main() -> None:
                 )
 
             if last_save_msg:
-                cv2.putText(
-                    display,
-                    last_save_msg,
-                    (12, 84),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 200, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                draw_wrapped_text(display, last_save_msg, x=12, y=84)
 
             cv2.imshow("Hands-Free capture", display)
             key = cv2.waitKey(1) & 0xFF
@@ -361,16 +472,16 @@ def main() -> None:
                 continue
 
             if key == ord("r"):
-                if label != "switch":
-                    last_save_msg = "r only works when label is switch (press 3)"
+                if label not in RECORDABLE_LABELS:
+                    last_save_msg = "r only for switch (3) or idle (0)"
                     continue
                 if not recording:
                     recording = True
                     record_buffer = []
                     record_started_ms = frame_ts_ms
-                    last_save_msg = "recording…"
+                    last_save_msg = f"recording {label}…"
                 else:
-                    path, msg = save_switch_clip(record_buffer)
+                    path, msg = save_video_clip(record_buffer, label)
                     recording = False
                     record_buffer = []
                     if path is not None:
@@ -380,8 +491,10 @@ def main() -> None:
                 continue
 
             if key == ord("s"):
-                if label in VIDEO_LABELS:
-                    last_save_msg = "switch uses r to start/stop, not s"
+                if label in VIDEO_ONLY_LABELS:
+                    last_save_msg = "switch is video-only — use r"
+                elif label not in STILL_LABELS:
+                    last_save_msg = f"s not supported for {label}"
                 elif hand_landmarks is None:
                     last_save_msg = "no hand — not saved"
                 else:

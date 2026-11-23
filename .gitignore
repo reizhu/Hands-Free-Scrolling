@@ -5,14 +5,19 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Collected training data (keep folder structure, ignore media)
+# Media — keep local / Drive; do not push
 data/images/
-data/landmarks/
 data/videos/
 *.mp4
 *.avi
 *.mov
+*.jpg
+*.jpeg
+*.png
+*.webp
 
-# Keep the MediaPipe .task model in git if you want teammates offline-ready;
-# uncomment the next line to ignore it instead:
+# Landmark JSONs ARE tracked (training features for the team)
+# data/landmarks/**/*.json
+
+# Optional: ignore MediaPipe model if you prefer downloading it locally
 # models/*.task
