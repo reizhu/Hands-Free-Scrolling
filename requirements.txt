@@ -2,3 +2,5 @@ opencv-python>=4.8
 mediapipe>=0.10.14
 numpy>=1.26
 pynput>=1.7.6
+scikit-learn>=1.4
+joblib>=1.3

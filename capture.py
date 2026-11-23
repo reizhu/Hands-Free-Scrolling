@@ -2,12 +2,12 @@
 Webcam capture + MediaPipe hand landmarks + labeled saves.
 
 Keys:
-  1  set label scroll_up   (still only)
-  2  set label scroll_down (still only)
-  3  set label switch      (video only)
-  0  set label idle        (still + video)
-  s  save still (scroll_up / scroll_down / idle)
-  r  start/stop video recording (switch / idle)
+  1  set label scroll_up   (index + middle out, still)
+  2  set label scroll_down (index out, still)
+  3  set label switch      (middle + ring + pinky out, still)
+  0  set label reject      (still + video)
+  s  save still (scroll_up / scroll_down / switch / reject)
+  r  start/stop video recording (reject)
   q  quit
 
 Stills:
@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import re
-import time
 from pathlib import Path
 
 import cv2
@@ -42,13 +41,13 @@ LABELS = {
     ord("1"): "scroll_up",
     ord("2"): "scroll_down",
     ord("3"): "switch",
-    ord("0"): "idle",
+    ord("0"): "reject",
 }
 
-# switch: video only. idle: still + video. scroll_*: still only.
-VIDEO_ONLY_LABELS = {"switch"}
-RECORDABLE_LABELS = {"switch", "idle"}
-STILL_LABELS = {"scroll_up", "scroll_down", "idle"}
+# Poses are stills. reject also allows video for motion negatives.
+VIDEO_ONLY_LABELS: set[str] = set()
+RECORDABLE_LABELS = {"reject"}
+STILL_LABELS = {"scroll_up", "scroll_down", "switch", "reject"}
 
 TARGET_FPS = 30
 MAX_RECORD_SECONDS = 5.0
@@ -212,7 +211,6 @@ def save_still(
         "label": label,
         "type": "still",
         "sample": name,
-        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "handedness": handedness,
         "image": str(img_path.relative_to(ROOT)).replace("\\", "/"),
         "landmarks": landmarks_to_list(hand_landmarks),
@@ -242,9 +240,9 @@ def save_video_clip(buffer: list[dict], label: str) -> tuple[Path | None, str]:
 
     frames_with_hand = sum(1 for item in buffer if item["landmarks"] is not None)
     if frames_with_hand < MIN_HAND_FRAMES:
-        return None, f"{label}: need ≥{MIN_HAND_FRAMES} hand frames (got {frames_with_hand})"
+        return None, f"{label}: need >={MIN_HAND_FRAMES} hand frames (got {frames_with_hand})"
 
-    # Same name → same clip: idle_0.mp4 <-> idle_0.json
+    # Same name -> same clip: reject_0.mp4 <-> reject_0.json
     name = next_sample_name(label)
     video_path = VIDEO_DIR / label / f"{name}.mp4"
     json_path = LANDMARK_DIR / label / f"{name}.json"
@@ -257,14 +255,12 @@ def save_video_clip(buffer: list[dict], label: str) -> tuple[Path | None, str]:
         (w, h),
     )
 
-    t0 = buffer[0]["t_ms"]
     sequence = []
     for i, item in enumerate(buffer):
         writer.write(item["frame"])
         sequence.append(
             {
                 "frame_index": i,
-                "t_ms": item["t_ms"],
                 "handedness": item["handedness"],
                 "landmarks": item["landmarks"],
             }
@@ -273,7 +269,6 @@ def save_video_clip(buffer: list[dict], label: str) -> tuple[Path | None, str]:
 
     written_frames = len(sequence)
     verified_frames = count_video_frames(video_path)
-    duration_s = (buffer[-1]["t_ms"] - t0) / 1000.0
     video_rel = str(video_path.relative_to(ROOT)).replace("\\", "/")
     json_rel = str(json_path.relative_to(ROOT)).replace("\\", "/")
 
@@ -282,9 +277,7 @@ def save_video_clip(buffer: list[dict], label: str) -> tuple[Path | None, str]:
         "type": "video",
         "sample": name,
         "pair_id": name,
-        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "fps": TARGET_FPS,
-        "duration_seconds": round(duration_s, 3),
         "num_frames": written_frames,
         "video_frame_count": verified_frames,
         "frames_match_video": verified_frames == written_frames,
@@ -326,7 +319,7 @@ def mode_text(label: str, recording: bool) -> str:
     if label in RECORDABLE_LABELS and label in STILL_LABELS:
         return "s=still / r=video"
     if label in RECORDABLE_LABELS:
-        return "ready — press r"
+        return "ready - press r"
     return "still"
 
 
@@ -348,7 +341,7 @@ def main() -> None:
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam (index 0).")
 
-    label = "idle"
+    label = "reject"
     saved_count = 0
     last_save_msg = ""
     frame_ts_ms = 0
@@ -358,7 +351,7 @@ def main() -> None:
     record_started_ms = 0
 
     print(
-        "Capture running. Keys: 1/2/3/0 label | s=still | r=video (switch/idle) | q=quit"
+        "Capture running. Keys: 1/2/3/0 label | s=still | r=video (reject) | q=quit"
     )
 
     try:
@@ -473,13 +466,13 @@ def main() -> None:
 
             if key == ord("r"):
                 if label not in RECORDABLE_LABELS:
-                    last_save_msg = "r only for switch (3) or idle (0)"
+                    last_save_msg = "r only for reject (0)"
                     continue
                 if not recording:
                     recording = True
                     record_buffer = []
                     record_started_ms = frame_ts_ms
-                    last_save_msg = f"recording {label}…"
+                    last_save_msg = f"recording {label}..."
                 else:
                     path, msg = save_video_clip(record_buffer, label)
                     recording = False
@@ -491,12 +484,10 @@ def main() -> None:
                 continue
 
             if key == ord("s"):
-                if label in VIDEO_ONLY_LABELS:
-                    last_save_msg = "switch is video-only — use r"
-                elif label not in STILL_LABELS:
+                if label not in STILL_LABELS:
                     last_save_msg = f"s not supported for {label}"
                 elif hand_landmarks is None:
-                    last_save_msg = "no hand — not saved"
+                    last_save_msg = "no hand - not saved"
                 else:
                     path = save_still(frame, hand_landmarks, label, handedness)
                     saved_count += 1
