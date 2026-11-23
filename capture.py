@@ -205,7 +205,10 @@ def save_still(
     img_path = IMAGE_DIR / label / f"{name}.jpg"
     json_path = LANDMARK_DIR / label / f"{name}.json"
 
-    cv2.imwrite(str(img_path), frame)
+    # Bake skeleton into review image (training uses JSON only).
+    save_frame = frame.copy()
+    draw_hand(save_frame, hand_landmarks)
+    cv2.imwrite(str(img_path), save_frame)
 
     payload = {
         "label": label,
@@ -384,9 +387,13 @@ def main() -> None:
                     handedness = {"Left": "Right", "Right": "Left"}.get(raw, raw)
 
             if recording:
+                # Bake skeleton into review video (no HUD text); JSON is training data.
+                rec_frame = frame.copy()
+                if hand_landmarks is not None:
+                    draw_hand(rec_frame, hand_landmarks)
                 record_buffer.append(
                     {
-                        "frame": frame.copy(),  # clean, no HUD
+                        "frame": rec_frame,
                         "t_ms": frame_ts_ms,
                         "handedness": handedness,
                         "landmarks": landmark_list,

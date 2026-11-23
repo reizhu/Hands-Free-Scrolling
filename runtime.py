@@ -34,7 +34,7 @@ POSE_MODEL = ROOT / "models" / "pose_classifier.joblib"
 
 DEAD_ZONE = 0.008
 SCROLL_GAIN = 40.0
-SWITCH_COOLDOWN_S = 0.8
+SWITCH_COOLDOWN_S = 1.5
 INDEX_TIP = 8
 MIDDLE_TIP = 12
 
