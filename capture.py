@@ -2,12 +2,11 @@
 Webcam capture + MediaPipe hand landmarks + labeled saves.
 
 Keys:
-  1  set label scroll_up   (index + middle out, still)
-  2  set label scroll_down (index out, still)
-  3  set label switch      (middle + ring + pinky out, still)
-  0  set label reject      (still + video)
-  s  save still (scroll_up / scroll_down / switch / reject)
-  r  start/stop video recording (reject)
+  1  set label scroll (RIGHT hand: index out, or index + middle out, still)
+  2  set label shaka  (RIGHT hand: thumb + pinky out, others curled, still) -> switch
+  0  set label idle (still + video)
+  s  save still (scroll / shaka / idle)
+  r  start/stop video recording (idle)
   q  quit
 
 Stills:
@@ -23,64 +22,41 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 import cv2
 import mediapipe as mp
 import numpy as np
-from mediapipe.tasks.python import vision
-from mediapipe.tasks.python.core import base_options as base_options_module
 
-ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "models" / "hand_landmarker.task"
+from pose import (
+    REQUIRED_HAND,
+    ROOT,
+    FrameClock,
+    draw_hand,
+    landmarks_to_dicts,
+    make_landmarker,
+    user_hand,
+)
+
 IMAGE_DIR = ROOT / "data" / "images"
 LANDMARK_DIR = ROOT / "data" / "landmarks"
 VIDEO_DIR = ROOT / "data" / "videos"
 
 LABELS = {
-    ord("1"): "scroll_up",
-    ord("2"): "scroll_down",
-    ord("3"): "switch",
-    ord("0"): "reject",
+    ord("1"): "scroll",
+    ord("2"): "shaka",
+    ord("0"): "idle",
 }
 
-# Poses are stills. reject also allows video for motion negatives.
+# Poses are stills. idle also allows video for motion negatives.
 VIDEO_ONLY_LABELS: set[str] = set()
-RECORDABLE_LABELS = {"reject"}
-STILL_LABELS = {"scroll_up", "scroll_down", "switch", "reject"}
+RECORDABLE_LABELS = {"idle"}
+STILL_LABELS = {"scroll", "shaka", "idle"}
 
 TARGET_FPS = 30
 MAX_RECORD_SECONDS = 5.0
 MIN_HAND_FRAMES = 5
-
-LANDMARK_NAMES = [
-    "wrist",
-    "thumb_cmc",
-    "thumb_mcp",
-    "thumb_ip",
-    "thumb_tip",
-    "index_mcp",
-    "index_pip",
-    "index_dip",
-    "index_tip",
-    "middle_mcp",
-    "middle_pip",
-    "middle_dip",
-    "middle_tip",
-    "ring_mcp",
-    "ring_pip",
-    "ring_dip",
-    "ring_tip",
-    "pinky_mcp",
-    "pinky_pip",
-    "pinky_dip",
-    "pinky_tip",
-]
-
-HAND_CONNECTIONS = [
-    (c.start, c.end) for c in vision.HandLandmarksConnections.HAND_CONNECTIONS
-]
-
 
 def ensure_dirs() -> None:
     for label in LABELS.values():
@@ -108,32 +84,6 @@ def next_sample_name(label: str) -> str:
     while n in used:
         n += 1
     return f"{label}_{n}"
-
-
-def landmarks_to_list(hand_landmarks) -> list[dict]:
-    out = []
-    for i, lm in enumerate(hand_landmarks):
-        out.append(
-            {
-                "name": LANDMARK_NAMES[i],
-                "x": lm.x,
-                "y": lm.y,
-                "z": lm.z,
-            }
-        )
-    return out
-
-
-def draw_hand(frame: np.ndarray, hand_landmarks) -> None:
-    h, w = frame.shape[:2]
-    points = []
-    for lm in hand_landmarks:
-        x, y = int(lm.x * w), int(lm.y * h)
-        points.append((x, y))
-        cv2.circle(frame, (x, y), 3, (0, 255, 0), -1, lineType=cv2.LINE_AA)
-
-    for start, end in HAND_CONNECTIONS:
-        cv2.line(frame, points[start], points[end], (0, 200, 255), 2, lineType=cv2.LINE_AA)
 
 
 def wrap_text(text: str, max_width_px: int, font_scale: float, thickness: int) -> list[str]:
@@ -214,9 +164,10 @@ def save_still(
         "label": label,
         "type": "still",
         "sample": name,
+        "captured_at": time.time(),  # train_pose.py groups near-duplicate stills by time
         "handedness": handedness,
         "image": str(img_path.relative_to(ROOT)).replace("\\", "/"),
-        "landmarks": landmarks_to_list(hand_landmarks),
+        "landmarks": landmarks_to_dicts(hand_landmarks),
     }
     json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return json_path
@@ -245,7 +196,7 @@ def save_video_clip(buffer: list[dict], label: str) -> tuple[Path | None, str]:
     if frames_with_hand < MIN_HAND_FRAMES:
         return None, f"{label}: need >={MIN_HAND_FRAMES} hand frames (got {frames_with_hand})"
 
-    # Same name -> same clip: reject_0.mp4 <-> reject_0.json
+    # Same name -> same clip: idle_0.mp4 <-> idle_0.json
     name = next_sample_name(label)
     video_path = VIDEO_DIR / label / f"{name}.mp4"
     json_path = LANDMARK_DIR / label / f"{name}.json"
@@ -298,24 +249,6 @@ def save_video_clip(buffer: list[dict], label: str) -> tuple[Path | None, str]:
     return json_path, msg
 
 
-def make_landmarker() -> vision.HandLandmarker:
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(
-            f"Missing model at {MODEL_PATH}. "
-            "Download hand_landmarker.task into models/."
-        )
-
-    options = vision.HandLandmarkerOptions(
-        base_options=base_options_module.BaseOptions(model_asset_path=str(MODEL_PATH)),
-        running_mode=vision.RunningMode.VIDEO,
-        num_hands=1,
-        min_hand_detection_confidence=0.6,
-        min_hand_presence_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
-    return vision.HandLandmarker.create_from_options(options)
-
-
 def mode_text(label: str, recording: bool) -> str:
     if recording:
         return "REC"
@@ -333,28 +266,28 @@ def hint_text(label: str, recording: bool) -> str:
         return "s save still | r start/stop video | q quit"
     if label in RECORDABLE_LABELS:
         return "r start/stop video | q quit"
-    return "1/2/3/0 label | s save still | q quit"
+    return "1/2/0 label | s save still | q quit"
 
 
 def main() -> None:
     ensure_dirs()
-    landmarker = make_landmarker()
+    landmarker = make_landmarker(num_hands=1)
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam (index 0).")
 
-    label = "reject"
+    label = "idle"
     saved_count = 0
     last_save_msg = ""
-    frame_ts_ms = 0
+    clock = FrameClock()
 
     recording = False
     record_buffer: list[dict] = []
     record_started_ms = 0
 
     print(
-        "Capture running. Keys: 1/2/3/0 label | s=still | r=video (reject) | q=quit"
+        "Capture running. Keys: 1/2/0 label | s=still | r=video (idle) | q=quit"
     )
 
     try:
@@ -369,7 +302,7 @@ def main() -> None:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            frame_ts_ms += 33  # ~30 fps monotonic timestamps for VIDEO mode
+            frame_ts_ms = clock.now_ms()
             result = landmarker.detect_for_video(mp_image, frame_ts_ms)
 
             hand_landmarks = None
@@ -378,13 +311,9 @@ def main() -> None:
 
             if result.hand_landmarks:
                 hand_landmarks = result.hand_landmarks[0]
-                landmark_list = landmarks_to_list(hand_landmarks)
+                landmark_list = landmarks_to_dicts(hand_landmarks)
                 if result.handedness:
-                    # Frame is mirrored above for a selfie view, which swaps
-                    # MediaPipe's Left/Right. Flip the label back to the user's
-                    # real hand.
-                    raw = result.handedness[0][0].category_name
-                    handedness = {"Left": "Right", "Right": "Left"}.get(raw, raw)
+                    handedness = user_hand(result.handedness[0][0].category_name)
 
             if recording:
                 # Bake skeleton into review video (no HUD text); JSON is training data.
@@ -473,7 +402,7 @@ def main() -> None:
 
             if key == ord("r"):
                 if label not in RECORDABLE_LABELS:
-                    last_save_msg = "r only for reject (0)"
+                    last_save_msg = "r only for idle (0)"
                     continue
                 if not recording:
                     recording = True
@@ -495,6 +424,8 @@ def main() -> None:
                     last_save_msg = f"s not supported for {label}"
                 elif hand_landmarks is None:
                     last_save_msg = "no hand - not saved"
+                elif label in REQUIRED_HAND and handedness != REQUIRED_HAND[label]:
+                    last_save_msg = f"{label} needs {REQUIRED_HAND[label]} hand (saw {handedness}) - not saved"
                 else:
                     path = save_still(frame, hand_landmarks, label, handedness)
                     saved_count += 1

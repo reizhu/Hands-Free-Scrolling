@@ -1,64 +1,44 @@
 """
 Pseudocode for the live control loop (see runtime.py for the real implementation).
 
-Poses:
-  scroll_up:   index + middle out
-  scroll_down: index out
-  switch:      middle + ring + pinky out
-  reject:      anything else
-
-One-way scroll:
-  scroll_up:   tips move DOWN -> scroll up; opposite ignored
-  scroll_down: tip moves UP   -> scroll down; opposite ignored
+One hand (right by default, --hand left) does everything.
+  scroll: index out, or index + middle out -> page follows the fingertip
+  shaka:  thumb + pinky out                -> Alt+Tab / Cmd+Tab once
+  idle:   anything else
+Ctrl+Alt+P (or p in the preview) pauses everything.
 """
 
-prev_y = None
-last_switch_t = 0
-SWITCH_COOLDOWN = 0.8  # seconds - stops Alt+Tab spam
-dead_zone = 0.008
+SWITCH_COOLDOWN = 1.5  # seconds - stops Alt+Tab spam
+dead_zone = 0.008  # image-heights
 gain = 40.0
-prev_state = None
+prev_shaka = False
+last_switch_t = 0
 
 while True:
     frame = webcam.read()
-    landmarks = mediapipe_hands(frame)
+    hand = mediapipe_hands(frame)  # gesture hand's landmarks or None
     t = now()
 
-    if not landmarks:
-        prev_y = None
-        prev_state = None
-        continue
+    # Classify (idle unless the winning SVM score beats the trained min_margin),
+    # then require the pose to repeat for a few frames before acting,
+    # so one bad frame can't scroll or switch. Paused feeds "idle".
+    raw = classifier(hand) if hand and not paused else "idle"
+    state = debounce(raw)  # scroll | shaka | idle
 
-    # CLASSIFIER STEP RUNS HERE.
-    state = classifier(landmarks)  # scroll_up | scroll_down | switch | reject
+    if state == "scroll" and raw == "scroll":
+        y = smooth(hand["index_tip"].y)  # EMA filter against jitter
+        # Measured from the last point that scrolled, so slow drags still add up.
+        dy = y - anchor
+        if abs(dy) > dead_zone:
+            speed = abs(dy) / (t - anchor_t)
+            boost = min(1 + speed / speed_ref, max_boost)  # faster drag, further scroll
+            send_scroll(gain * boost * dy)  # finger down -> scroll up
+            anchor, anchor_t = y, t
+    else:
+        reset_scroller()
 
-    if state == "scroll_up":
-        # Track index + middle tips (average)
-        y = (landmarks["index_tip"].y + landmarks["middle_tip"].y) / 2
-        if prev_y is not None:
-            dy = y - prev_y  # tips moved down
-            if dy > dead_zone:  # one-way: ignore tips moving up
-                send_scroll(+gain * dy)  # up
-        prev_y = y
-
-    elif state == "scroll_down":
-        y = landmarks["index_tip"].y
-        if prev_y is not None:
-            dy = prev_y - y  # tip moved up
-            if dy > dead_zone:  # one-way: ignore tip moving down
-                send_scroll(-gain * dy)  # down
-        prev_y = y
-
-    elif state == "switch":
-        prev_y = None
-        # Fire once on entering the pose
-        if prev_state != "switch" and t - last_switch_t > SWITCH_COOLDOWN:
-            # Windows: Alt+Tab once
-            # Mac: Cmd+Tab once
-            send_hotkey("alt+tab")  # or "cmd+tab"
-            last_switch_t = t
-
-    else:  # reject
-        prev_y = None
-
-    prev_state = state
+    shaka = state == "shaka"
+    if shaka and not prev_shaka and t - last_switch_t > SWITCH_COOLDOWN:
+        send_hotkey("alt+tab")  # or "cmd+tab" on Mac
+        last_switch_t = t
+    prev_shaka = shaka
