@@ -109,28 +109,92 @@ def send_alt_tab(keyboard: KeyboardController) -> None:
     keyboard.release(modifier)
 
 
+def open_camera(index: int = 0) -> cv2.VideoCapture:
+    """Open webcam and verify real frames (Windows often lies with isOpened())."""
+    backends: list[int] = []
+    if sys.platform == "win32":
+        # DirectShow is the reliable Windows backend; MSMF often opens then fails reads.
+        backends.extend([cv2.CAP_DSHOW, cv2.CAP_MSMF])
+    backends.append(cv2.CAP_ANY)
+
+    tried: list[str] = []
+    for backend in backends:
+        cap = cv2.VideoCapture(index, backend)
+        label = {
+            cv2.CAP_DSHOW: "DSHOW",
+            cv2.CAP_MSMF: "MSMF",
+            cv2.CAP_ANY: "ANY",
+        }.get(backend, str(backend))
+        tried.append(label)
+        if not cap.isOpened():
+            cap.release()
+            continue
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        ok, frame = False, None
+        for _ in range(40):
+            ok, frame = cap.read()
+            if ok and frame is not None and getattr(frame, "size", 0) > 0:
+                print(f"Webcam opened (index {index}, backend {label}).")
+                return cap
+            time.sleep(0.05)
+
+        cap.release()
+
+    raise RuntimeError(
+        f"Webcam index {index} opened but returned no frames "
+        f"(tried backends: {', '.join(tried)}). "
+        "Close Zoom/Teams/capture.py/other camera apps and retry."
+    )
+
+
+def read_frame(cap: cv2.VideoCapture, retries: int = 10) -> np.ndarray | None:
+    for _ in range(retries):
+        ok, frame = cap.read()
+        if ok and frame is not None and getattr(frame, "size", 0) > 0:
+            return frame
+        time.sleep(0.02)
+    return None
+
+
 def main() -> None:
     clf = load_pose_classifier()
     landmarker = make_landmarker()
     mouse = MouseController()
     keyboard = KeyboardController()
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open webcam (index 0).")
+    cap = open_camera(0)
 
     prev_tip_y: float | None = None
     prev_state: str | None = None
     last_switch_t = 0.0
     frame_ts_ms = 0
+    consecutive_misses = 0
+
+    window_name = "Hands-Free runtime"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 960, 720)
 
     print("Runtime started. Focus a scrollable window. q=quit")
 
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+            frame = read_frame(cap)
+            if frame is None:
+                consecutive_misses += 1
+                if consecutive_misses >= 30:
+                    raise RuntimeError(
+                        "Lost webcam frames repeatedly. "
+                        "Is another app using the camera?"
+                    )
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord("q"):
+                    break
+                continue
+            consecutive_misses = 0
 
             frame = cv2.flip(frame, 1)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -202,7 +266,7 @@ def main() -> None:
                 1,
                 cv2.LINE_AA,
             )
-            cv2.imshow("Hands-Free runtime", frame)
+            cv2.imshow(window_name, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
