@@ -5,16 +5,11 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Media — keep local / Drive; do not push
-data/images/
+# Videos — keep local / Drive; do not push
 data/videos/
 *.mp4
 *.avi
 *.mov
-*.jpg
-*.jpeg
-*.png
-*.webp
 
 # Landmark JSONs ARE tracked (training features for the team)
 # data/landmarks/**/*.json
